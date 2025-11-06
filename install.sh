@@ -11,6 +11,6 @@ make
 
 # Setup project directory
 mkdir -p $XDG_DATA_HOME/rtsp-server/
-cp $THIS_DIR/build/rtsp-server ~/.local/bin
+cp $THIS_DIR/build/rtsp-server "${HOME}/.local/bin"
 cp $THIS_DIR/config.toml $XDG_DATA_HOME/rtsp-server/
 
