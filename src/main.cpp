@@ -1,6 +1,7 @@
 #include "RtspServer.hpp"
 #include "Config.hpp"
 #include <iostream>
+#include <filesystem>
 #include <toml.hpp>
 
 int main()
@@ -20,8 +21,14 @@ int main()
 		}
 	};
 
+	// Two-tier config lookup: user override > deb-installed default
+	const std::string home = getenv("HOME") ? getenv("HOME") : "/tmp";
+	const auto user_config = std::filesystem::path(home) / ".config/ark/rtsp-server/config.toml";
+	const auto default_config = std::filesystem::path("/opt/ark/share/rtsp-server/config.toml");
+	const auto config_path = std::filesystem::exists(user_config) ? user_config : default_config;
+
 	try {
-		toml::table tomlConfig = toml::parse_file(std::string(getenv("HOME")) + "/.local/share/rtsp-server/config.toml");
+		toml::table tomlConfig = toml::parse_file(config_path.string());
 
 		// RTSP server config
 		if (auto rtsp = tomlConfig["rtsp"].as_table()) {
