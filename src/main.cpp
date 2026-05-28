@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <toml.hpp>
 
-int main()
+int main(int argc, char** argv)
 {
 	// Initialize default configuration
 	AppConfig config = {
@@ -21,14 +21,26 @@ int main()
 		}
 	};
 
-	// Two-tier config lookup: user override > deb-installed default
+	// Config lookup: --config <path> (or --config=<path>) overrides everything;
+	// otherwise user override > deb-installed default.
 	const std::string home = getenv("HOME") ? getenv("HOME") : "/tmp";
 	const auto user_config = std::filesystem::path(home) / ".config/ark/rtsp-server/config.toml";
 	const auto default_config = std::filesystem::path("/opt/ark/share/rtsp-server/config.toml");
-	const auto config_path = std::filesystem::exists(user_config) ? user_config : default_config;
+	std::string config_path = (std::filesystem::exists(user_config) ? user_config : default_config).string();
+
+	for (int i = 1; i < argc; i++) {
+		std::string arg = argv[i];
+
+		if (arg == "--config" && i + 1 < argc) {
+			config_path = argv[++i];
+
+		} else if (arg.rfind("--config=", 0) == 0) {
+			config_path = arg.substr(std::string("--config=").size());
+		}
+	}
 
 	try {
-		toml::table tomlConfig = toml::parse_file(config_path.string());
+		toml::table tomlConfig = toml::parse_file(config_path);
 
 		// RTSP server config
 		if (auto rtsp = tomlConfig["rtsp"].as_table()) {
