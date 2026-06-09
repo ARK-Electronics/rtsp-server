@@ -53,8 +53,18 @@ int main(int argc, char** argv)
 			}
 
 			if (rtsp->contains("port")) {
-				int port = (*rtsp)["port"].value_or(5600);
-				config.server.port = std::to_string(port);
+				// Accept the port whether it is stored as a TOML integer
+				// (port = 5600) or a quoted string (port = "5600"). value_or<int>
+				// silently returns the fallback when the stored type does not
+				// match, so handle both forms explicitly.
+				auto port = (*rtsp)["port"];
+
+				if (auto i = port.value<int64_t>()) {
+					config.server.port = std::to_string(*i);
+
+				} else if (auto s = port.value<std::string>()) {
+					config.server.port = *s;
+				}
 			}
 		}
 
