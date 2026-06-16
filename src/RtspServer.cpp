@@ -10,6 +10,10 @@
 #include <chrono>
 #include <thread>
 #include <csignal>
+#include <filesystem>
+#include <system_error>
+#include <ctime>
+#include <sys/stat.h>
 
 // namespace gst c lib for readability
 namespace gst
@@ -42,11 +46,171 @@ gst::GstRTSPFilterResult ref_client(gst::GstRTSPServer*, gst::GstRTSPClient*, gs
 
 } // namespace
 
-RtspServer::RtspServer(const ServerConfig& serverConfig, const CameraConfig& cameraConfig)
+// HLS segments are written to tmpfs (RAM) so the segment churn never wears the SD
+// card; nginx serves this directory at /video/hls/. Default umask leaves the files
+// world-readable so nginx (www-data) can serve them.
+static constexpr const char* HLS_OUTPUT_DIR = "/dev/shm/ark-rtsp-hls";
+
+// Viewer-presence lease. The web UI's gateway touches this file while the Video page
+// is open (POST /api/video/keepalive) and removes it when the page closes. We only
+// stat() its mtime — no read permission needed — and it lives beside, not inside,
+// HLS_OUTPUT_DIR so nginx never serves it.
+static constexpr const char* HLS_LEASE_FILE = "/dev/shm/ark-rtsp-hls.lease";
+// The lease counts as live if touched within this window; the page heartbeats every
+// few seconds, so a couple of missed beats (tab hidden, client gone) lets HLS stop.
+static constexpr int HLS_LEASE_TTL_SECONDS = 6;
+// How often we reconcile the pipeline against the lease.
+static constexpr int HLS_POLL_SECONDS = 1;
+// After a pipeline error/EOS (camera unavailable, or RTSP media not ready yet) wait this
+// long before rebuilding, so a viewer watching a broken camera doesn't spam the log at
+// the poll rate.
+static constexpr int HLS_ERROR_BACKOFF_SECONDS = 3;
+
+namespace gst
+{
+namespace
+{
+
+// On-demand loopback HLS pipeline. It is an ordinary RTSP client of our own server,
+// so the camera stays owned solely by the RTSP media factory (one exclusive source,
+// shared across clients) and this branch only depays + remuxes to MPEG-TS — no
+// decode/re-encode. It runs only while a viewer lease is fresh, so the camera and
+// encoder spin up when someone opens the Video page and release when they leave. The
+// context outlives run() (which never returns), so it is intentionally leaked.
+struct HlsContext {
+	std::string launch;
+	GstElement* pipeline;   // null while idle (no viewers) or between reconnects
+	bool parseFailed;       // pipeline could not be built (missing element); stop trying
+	time_t retryAfter;      // earliest time to rebuild after an error (backoff)
+};
+
+// Fresh if the lease file exists and was touched within the TTL. stat() needs only
+// search permission on /dev/shm (world-traversable), not read on the file, and
+// st_mtime shares time()'s epoch — so no permission coupling or clock conversion.
+bool lease_is_fresh()
+{
+	struct stat st;
+
+	if (::stat(HLS_LEASE_FILE, &st) != 0) {
+		return false;
+	}
+
+	return std::time(nullptr) - st.st_mtime <= HLS_LEASE_TTL_SECONDS;
+}
+
+gboolean hls_bus_cb(GstBus* bus, GstMessage* msg, gpointer user_data);
+
+// Tear the pipeline down, releasing our loopback RTSP client so the shared camera
+// media can stop once no other clients remain. The caller has already removed the bus
+// watch, or is the bus callback itself returning G_SOURCE_REMOVE.
+void hls_drop_pipeline(HlsContext* ctx)
+{
+	if (ctx->pipeline) {
+		gst_element_set_state(ctx->pipeline, GST_STATE_NULL);
+		gst_object_unref(ctx->pipeline);
+		ctx->pipeline = nullptr;
+	}
+}
+
+void hls_start_pipeline(HlsContext* ctx)
+{
+	GError* err = nullptr;
+	ctx->pipeline = gst_parse_launch(ctx->launch.c_str(), &err);
+
+	if (!ctx->pipeline) {
+		// A parse failure means a missing element (e.g. hlssink2) — not self-correcting,
+		// so latch it off and log once rather than rebuilding on every poll.
+		g_printerr("HLS: could not build pipeline: %s\n", err ? err->message : "unknown error");
+		g_clear_error(&err);
+		ctx->parseFailed = true;
+		return;
+	}
+
+	g_clear_error(&err);
+
+	GstBus* bus = gst_element_get_bus(ctx->pipeline);
+	gst_bus_add_watch(bus, hls_bus_cb, ctx);
+	gst_object_unref(bus);
+
+	gst_element_set_state(ctx->pipeline, GST_STATE_PLAYING);
+	std::cout << "HLS: viewer present, restreaming to /video/hls/stream.m3u8" << std::endl;
+}
+
+// Explicit stop (the viewer left). Unlike the bus callback we are not inside the watch,
+// so remove it before dropping the pipeline.
+void hls_stop_pipeline(HlsContext* ctx)
+{
+	if (!ctx->pipeline) {
+		return;
+	}
+
+	GstBus* bus = gst_element_get_bus(ctx->pipeline);
+	gst_bus_remove_watch(bus);
+	gst_object_unref(bus);
+	hls_drop_pipeline(ctx);
+	std::cout << "HLS: no viewers, camera released" << std::endl;
+}
+
+gboolean hls_bus_cb(GstBus* /*bus*/, GstMessage* msg, gpointer user_data)
+{
+	HlsContext* ctx = static_cast<HlsContext*>(user_data);
+
+	switch (GST_MESSAGE_TYPE(msg)) {
+	case GST_MESSAGE_ERROR: {
+		GError* err = nullptr;
+		gchar* dbg = nullptr;
+		gst_message_parse_error(msg, &err, &dbg);
+		g_printerr("HLS: pipeline error: %s\n", err ? err->message : "unknown error");
+		g_clear_error(&err);
+		g_free(dbg);
+		[[fallthrough]];
+	}
+
+	case GST_MESSAGE_EOS:
+		// Usually the RTSP server was not accepting yet, or the shared media was torn
+		// down. Drop the pipeline; the lease poll rebuilds it after a short backoff if a
+		// viewer is still present.
+		hls_drop_pipeline(ctx);
+		ctx->retryAfter = std::time(nullptr) + HLS_ERROR_BACKOFF_SECONDS;
+		return G_SOURCE_REMOVE; // a rebuilt pipeline installs its own watch
+
+	default:
+		return G_SOURCE_CONTINUE;
+	}
+}
+
+// Reconcile the pipeline against the viewer lease once per tick: start when a viewer
+// appears, stop when the last one leaves.
+gboolean hls_lease_poll_cb(gpointer user_data)
+{
+	HlsContext* ctx = static_cast<HlsContext*>(user_data);
+	const bool viewer = lease_is_fresh();
+
+	if (viewer && !ctx->pipeline && !ctx->parseFailed && std::time(nullptr) >= ctx->retryAfter) {
+		hls_start_pipeline(ctx);
+
+	} else if (!viewer && ctx->pipeline) {
+		hls_stop_pipeline(ctx);
+	}
+
+	return G_SOURCE_CONTINUE;
+}
+
+void start_hls_on_demand(const std::string& launch)
+{
+	HlsContext* ctx = new HlsContext{launch, nullptr, false, 0};
+	gst::g_timeout_add_seconds(HLS_POLL_SECONDS, hls_lease_poll_cb, ctx);
+}
+
+} // namespace
+} // namespace gst
+
+RtspServer::RtspServer(const ServerConfig& serverConfig, const CameraConfig& cameraConfig, const HlsConfig& hlsConfig)
 	: _path(serverConfig.path)
 	, _address(serverConfig.address)
 	, _port(serverConfig.port)
 	, _cameraConfig(cameraConfig)
+	, _hlsConfig(hlsConfig)
 {
 	std::cout << "Camera config: "
 		  << _cameraConfig.getWidth() << "x" << _cameraConfig.getHeight()
@@ -77,6 +241,11 @@ void RtspServer::run()
 
 	gst::gst_rtsp_media_factory_set_launch(factory, pipeline.c_str());
 
+	// Share one media (camera pipeline) across all clients. The camera source is
+	// exclusive, so without this a second consumer — the HLS loopback below, or a
+	// second RTSP client — would fail to open it.
+	gst::gst_rtsp_media_factory_set_shared(factory, TRUE);
+
 	gst::gst_rtsp_mount_points_add_factory(mounts, std::string("/" + _path).c_str(), factory);
 	gst::g_object_unref(mounts);
 
@@ -90,6 +259,26 @@ void RtspServer::run()
 	gst::g_unix_signal_add(SIGTERM, quit_main_loop, loop);
 
 	std::cout << "Stream ready at rtsp://" << _address << ":" << _port << "/" << _path << std::endl << std::endl;
+
+	if (_hlsConfig.enabled) {
+		std::error_code ec;
+		// Start each run from a clean directory so stale segments from a previous run
+		// can't linger in the playlist. The pipeline itself starts on demand, once the
+		// Video page signals a viewer via the lease (see start_hls_on_demand).
+		std::filesystem::remove_all(HLS_OUTPUT_DIR, ec);
+		std::filesystem::create_directories(HLS_OUTPUT_DIR, ec);
+
+		if (ec) {
+			std::cerr << "HLS: could not create " << HLS_OUTPUT_DIR << ": " << ec.message()
+				  << " — HLS disabled" << std::endl;
+
+		} else {
+			gst::start_hls_on_demand(get_hls_launch());
+			std::cout << "HLS available on demand at /video/hls/stream.m3u8 "
+				  << "(streams only while the Video page is open)" << std::endl;
+		}
+	}
+
 	gst::g_main_loop_run(loop);
 
 	// Reached only after a shutdown signal. Close each connected client so its media
@@ -327,4 +516,24 @@ RtspServer::Platform RtspServer::detect_platform()
 
 	std::cout << "Platform: Ubuntu Desktop" << std::endl;
 	return Platform::Ubuntu;
+}
+
+std::string RtspServer::get_hls_launch()
+{
+	// Consume our own RTSP stream over loopback and remux H.264 into HLS segments.
+	// No decode/re-encode: rtph264depay + h264parse hand the elementary stream to
+	// hlssink2, which writes the .ts segments and the .m3u8 playlist on tmpfs.
+	std::stringstream ss;
+
+	ss << "rtspsrc location=rtsp://127.0.0.1:" << _port << "/" << _path
+	   << " latency=0 protocols=tcp ! "
+	   << "rtph264depay ! h264parse ! "
+	   << "hlssink2 target-duration=" << _hlsConfig.segmentDuration
+	   << " playlist-length=" << _hlsConfig.playlistLength
+	   << " max-files=" << (_hlsConfig.playlistLength + 2)
+	   << " location=" << HLS_OUTPUT_DIR << "/segment%05d.ts"
+	   << " playlist-location=" << HLS_OUTPUT_DIR << "/stream.m3u8";
+
+	std::cout << "Using HLS pipeline: " << ss.str() << std::endl;
+	return ss.str();
 }
