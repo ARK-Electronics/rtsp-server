@@ -132,9 +132,12 @@ std::string RtspServer::create_pi_pipeline()
 	// Cap framerate at 30fps
 	int framerate = std::min(_cameraConfig.framerate, 30);
 
-	// Start building the pipeline
+	// Start building the pipeline.
+	// format=NV12 is required: without an explicit format, libcamerasrc negotiates its
+	// src pad to the sensor's RAW Bayer stream (e.g. imx708 -> SBGGR16), which videoconvert
+	// cannot consume -> "not-negotiated". NV12 is the PiSP ISP's native processed output.
 	ss << "( libcamerasrc ! "
-	   << "video/x-raw,width=" << width
+	   << "video/x-raw,format=NV12,width=" << width
 	   << ",height=" << height
 	   << ",framerate=" << framerate << "/1 ! "
 	   << "videoconvert ! ";
