@@ -7,6 +7,8 @@
 #include <memory>
 #include <sstream>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 // namespace gst c lib for readability
 namespace gst
@@ -85,16 +87,24 @@ std::string RtspServer::create_jetson_pipeline()
 	// camera ("Frame Rate specified is greater than supported"), which then cascades
 	// into "No cameras available" under the systemd restart loop.
 	const int sensorId = 0;
-	const std::vector<SensorMode> modes = probe_sensor_modes(sensorId);
+
+	// Retry the probe until the sensor reports its modes instead of falling back.
+	// Right after a restart the previous process's nvarguscamerasrc can still hold
+	// /dev/video0, so v4l2-ctl sees EBUSY and prints nothing — a transient. Falling
+	// back would mean streaming at the requested framerate the sensor may not
+	// support, so it is better to wait a moment for a real answer.
+	std::vector<SensorMode> modes = probe_sensor_modes(sensorId);
+
+	for (int attempt = 1; modes.empty(); ++attempt) {
+		std::cout << "No sensor modes detected (attempt " << attempt
+			  << "; is v4l-utils installed and the camera free?); retrying in 1s..." << std::endl;
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		modes = probe_sensor_modes(sensorId);
+	}
 
 	for (const auto& m : modes) {
 		std::cout << "Detected sensor mode: " << m.width << "x" << m.height
 			  << " @ " << m.max_fps << "fps" << std::endl;
-	}
-
-	if (modes.empty()) {
-		std::cout << "WARNING: no sensor modes detected (is v4l2-ctl installed?); "
-			  << "using requested settings." << std::endl;
 	}
 
 	const StreamProfile profile = select_stream_profile(
