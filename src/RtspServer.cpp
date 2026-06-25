@@ -9,13 +9,38 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <csignal>
 
 // namespace gst c lib for readability
 namespace gst
 {
 #include <gst/gst.h>
 #include <gst/rtsp-server/rtsp-server.h>
+#include <glib-unix.h>
 }
+
+namespace
+{
+
+// Installed for SIGINT/SIGTERM via g_unix_signal_add, which dispatches it from the
+// main loop (not from async-signal context), so quitting the loop here is safe.
+// Returning G_SOURCE_REMOVE uninstalls the handler, so a second signal falls through
+// to the default disposition and still force-kills us if teardown ever hangs.
+gst::gboolean quit_main_loop(gst::gpointer loop)
+{
+	std::cout << std::endl << "Shutting down RTSP server..." << std::endl;
+	gst::g_main_loop_quit(static_cast<gst::GMainLoop*>(loop));
+	return G_SOURCE_REMOVE;
+}
+
+// Collect every connected client (REF adds it to the filter's result list) so each
+// can be closed explicitly on shutdown.
+gst::GstRTSPFilterResult ref_client(gst::GstRTSPServer*, gst::GstRTSPClient*, gst::gpointer)
+{
+	return gst::GST_RTSP_FILTER_REF;
+}
+
+} // namespace
 
 RtspServer::RtspServer(const ServerConfig& serverConfig, const CameraConfig& cameraConfig)
 	: _path(serverConfig.path)
@@ -58,8 +83,29 @@ void RtspServer::run()
 	// TODO: we need to handle bad disconnect events gracefully (client loses network connection and doesn't end session)
 	gst::gst_rtsp_server_attach(server, NULL);
 
+	// Quit the loop on SIGINT/SIGTERM so a systemd stop/restart triggers a graceful
+	// teardown below instead of the process being killed mid-stream.
+	loop = gst::g_main_loop_new(NULL, FALSE);
+	gst::g_unix_signal_add(SIGINT, quit_main_loop, loop);
+	gst::g_unix_signal_add(SIGTERM, quit_main_loop, loop);
+
 	std::cout << "Stream ready at rtsp://" << _address << ":" << _port << "/" << _path << std::endl << std::endl;
-	gst::g_main_loop_run(gst::g_main_loop_new(NULL, FALSE));
+	gst::g_main_loop_run(loop);
+
+	// Reached only after a shutdown signal. Close each connected client so its media
+	// pipeline (nvarguscamerasrc) is set to NULL and the Argus camera session is
+	// released cleanly — otherwise nvargus-daemon logs "(Argus) Error EndOfFile" when
+	// the socket drops as the process exits.
+	gst::GList* clients = gst::gst_rtsp_server_client_filter(server, ref_client, nullptr);
+
+	for (gst::GList* l = clients; l != nullptr; l = l->next) {
+		gst::gst_rtsp_client_close(static_cast<gst::GstRTSPClient*>(l->data));
+		gst::g_object_unref(l->data);
+	}
+
+	gst::g_list_free(clients);
+	gst::g_main_loop_unref(loop);
+	gst::g_object_unref(server);
 }
 
 std::string RtspServer::get_pipeline(Platform platform)
