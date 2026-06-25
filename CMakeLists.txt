@@ -15,6 +15,7 @@ include_directories(third_party/tomlplusplus/)
 add_executable(rtsp-server
 	src/main.cpp
 	src/Config.cpp
+	src/CameraProbe.cpp
 	src/RtspServer.cpp
 )
 

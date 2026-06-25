@@ -1,4 +1,5 @@
 #include "RtspServer.hpp"
+#include "CameraProbe.hpp"
 #include <array>
 #include <cstdio>
 #include <iostream>
@@ -79,17 +80,29 @@ std::string RtspServer::create_jetson_pipeline()
 {
 	std::stringstream ss;
 
-	// Base dimensions
-	int width = _cameraConfig.getWidth();
-	int height = _cameraConfig.getHeight();
-	// Cap framerate at 30fps
-	int framerate = std::min(_cameraConfig.framerate, 30);
+	// Clamp the requested settings to the sensor's real capabilities. Requesting a
+	// framerate the sensor can't deliver makes nvarguscamerasrc fail to acquire the
+	// camera ("Frame Rate specified is greater than supported"), which then cascades
+	// into "No cameras available" under the systemd restart loop.
+	const int sensorId = 0;
+	const std::vector<SensorMode> modes = probe_sensor_modes(sensorId);
 
-	// Start building the pipeline
-	ss << "( nvarguscamerasrc sensor-id=0 ! "
-	   << "video/x-raw(memory:NVMM),width=" << width
-	   << ",height=" << height
-	   << ",framerate=" << framerate << "/1 ! ";
+	for (const auto& m : modes) {
+		std::cout << "Detected sensor mode: " << m.width << "x" << m.height
+			  << " @ " << m.max_fps << "fps" << std::endl;
+	}
+
+	if (modes.empty()) {
+		std::cout << "WARNING: no sensor modes detected (is v4l2-ctl installed?); "
+			  << "using requested settings." << std::endl;
+	}
+
+	const StreamProfile profile = select_stream_profile(
+					      modes, _cameraConfig.getWidth(), _cameraConfig.getHeight(), _cameraConfig.framerate);
+
+	std::cout << "Requested " << _cameraConfig.getWidth() << "x" << _cameraConfig.getHeight()
+		  << " @ " << _cameraConfig.framerate << "fps; streaming "
+		  << profile.width << "x" << profile.height << " @ " << profile.framerate << "fps" << std::endl;
 
 	// Apply rotation using nvvidconv with flip-method
 	// 0 = no rotation
@@ -108,12 +121,24 @@ std::string RtspServer::create_jetson_pipeline()
 	default: flipMethod = 0; break;
 	}
 
-	// Apply the rotation
-	ss << "nvvidconv flip-method=" << flipMethod << " ! "
-	   << "video/x-raw,format=I420 ! ";
+	// Output size after rotation: 90/270 swap width and height.
+	int outWidth = profile.width;
+	int outHeight = profile.height;
 
-	// Complete the pipeline with encoder and payloader
-	ss << "x264enc key-int-max=30 bitrate=" << _cameraConfig.bitrate
+	if (_cameraConfig.rotation == CameraRotation::ROTATE_90 || _cameraConfig.rotation == CameraRotation::ROTATE_270) {
+		std::swap(outWidth, outHeight);
+	}
+
+	// nvarguscamerasrc selects the sensor mode from these caps; the framerate must be
+	// one the sensor advertises. nvvidconv then enforces the final output size, so the
+	// result is deterministic even if argus emits the full sensor resolution.
+	ss << "( nvarguscamerasrc sensor-id=" << sensorId << " ! "
+	   << "video/x-raw(memory:NVMM),width=" << profile.width
+	   << ",height=" << profile.height
+	   << ",framerate=" << profile.framerate << "/1 ! "
+	   << "nvvidconv flip-method=" << flipMethod << " ! "
+	   << "video/x-raw,width=" << outWidth << ",height=" << outHeight << ",format=I420 ! "
+	   << "x264enc key-int-max=" << profile.framerate << " bitrate=" << _cameraConfig.bitrate
 	   << " tune=zerolatency speed-preset=ultrafast ! "
 	   << "video/x-h264,stream-format=byte-stream,profile=baseline ! "
 	   << "rtph264pay config-interval=1 mtu=1400 name=pay0 pt=96 )";

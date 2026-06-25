@@ -3,6 +3,9 @@ url = "camera1"
 address = "0.0.0.0"
 port = 5600
 
+# On Jetson, framerate and resolution are the desired values; the server probes
+# the sensor's actual modes and clamps them to what it supports (e.g. an IMX708
+# advertising only 4608x2592@14 will stream at 14fps regardless of the value here).
 [camera]
 framerate = 30
 bitrate = 5000

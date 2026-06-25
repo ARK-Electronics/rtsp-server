@@ -39,3 +39,6 @@ or
 ```
 gst-launch-1.0 rtspsrc location=rtsp://0.0.0.0:5600/camera1 latency=0 ! rtph264depay ! avdec_h264 ! videoconvert ! autovideosink
 ```
+
+## Camera auto-detection (Jetson)
+The `framerate` and `resolution` in `config.toml` are treated as desired values. On Jetson the server probes the sensor's real capture modes (via `v4l2-ctl --list-formats-ext`) and clamps them to what the sensor actually supports before building the pipeline. This prevents `nvarguscamerasrc` from failing to acquire the camera ("Frame Rate specified is greater than supported" → "No cameras available") when the configured framerate exceeds the sensor's mode — e.g. an IMX708 that only advertises `4608x2592@14` will stream at 14fps. Requires `v4l-utils`; if detection finds nothing the server falls back to the requested values.
