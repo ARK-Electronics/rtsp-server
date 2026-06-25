@@ -6,7 +6,7 @@
 class RtspServer
 {
 public:
-	RtspServer(const ServerConfig& serverConfig, const CameraConfig& cameraConfig);
+	RtspServer(const ServerConfig& serverConfig, const CameraConfig& cameraConfig, const HlsConfig& hlsConfig);
 	void run();
 
 private:
@@ -22,6 +22,9 @@ private:
 	std::string create_pi_pipeline();
 	std::string create_ubuntu_pipeline();
 
+	// Loopback restream of the RTSP stream into HLS segments on tmpfs
+	std::string get_hls_launch();
+
 	// Server configuration
 	std::string _path;
 	std::string _address;
@@ -29,4 +32,7 @@ private:
 
 	// Camera configuration
 	CameraConfig _cameraConfig;
+
+	// HLS restream configuration
+	HlsConfig _hlsConfig;
 };
