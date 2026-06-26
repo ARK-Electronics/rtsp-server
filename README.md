@@ -42,15 +42,3 @@ gst-launch-1.0 rtspsrc location=rtsp://0.0.0.0:5600/camera1 latency=0 ! rtph264d
 
 ## Camera auto-detection (Jetson)
 The `framerate` and `resolution` in `config.toml` are treated as desired values. On Jetson the server probes the sensor's real capture modes (via `v4l2-ctl --list-formats-ext`) and clamps them to what the sensor actually supports before building the pipeline. This prevents `nvarguscamerasrc` from failing to acquire the camera ("Frame Rate specified is greater than supported" → "No cameras available") when the configured framerate exceeds the sensor's mode — e.g. an IMX708 that only advertises `4608x2592@14` will stream at 14fps. Requires `v4l-utils`. If the probe comes back empty — e.g. a just-restarted instance whose `nvarguscamerasrc` still holds the camera, so `v4l2-ctl` sees `EBUSY` — the server retries once a second until the sensor reports its modes rather than guessing at the requested values.
-
-## Browser viewing (HLS)
-Browsers cannot play RTSP directly. With `enabled = true` under `[hls]` in the config, the
-server can additionally consume its own RTSP stream over loopback and remux it (no re-encode)
-into HLS segments written to tmpfs at `/dev/shm/ark-rtsp-hls/`. In ARK-OS, nginx serves these
-at `/video/hls/stream.m3u8` and the web UI's Video page plays them with hls.js. HLS adds a few
-seconds of latency versus RTSP. Requires the `hlssink2` element (`gstreamer1.0-plugins-bad`).
-
-The restream runs **on demand**: the server starts it only while the Video page is open and
-stops it — releasing the camera — shortly after the last viewer leaves, so an idle device pays
-nothing. Presence is signalled by a lease file (`/dev/shm/ark-rtsp-hls.lease`) that the ARK-OS
-gateway touches on a heartbeat from the page; the server polls that lease once a second.

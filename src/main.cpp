@@ -18,11 +18,6 @@ int main(int argc, char** argv)
 			.framerate = 15,
 			.bitrate = 2000,
 			.rotation = CameraRotation::ROTATE_0
-		},
-		.hls = {
-			.enabled = false,
-			.segmentDuration = 1,
-			.playlistLength = 5
 		}
 	};
 
@@ -99,22 +94,6 @@ int main(int argc, char** argv)
 			}
 		}
 
-		// HLS config (browser-playable restream; off by default)
-		if (auto hls = tomlConfig["hls"].as_table()) {
-			if (hls->contains("enabled")) {
-				config.hls.enabled = (*hls)["enabled"].value_or(false);
-				std::cout << "HLS " << (config.hls.enabled ? "enabled" : "disabled") << std::endl;
-			}
-
-			if (hls->contains("segment_duration")) {
-				config.hls.segmentDuration = (*hls)["segment_duration"].value_or(1);
-			}
-
-			if (hls->contains("playlist_length")) {
-				config.hls.playlistLength = (*hls)["playlist_length"].value_or(5);
-			}
-		}
-
 	} catch (const toml::parse_error& err) {
 		std::cerr << "Parsing failed:\n" << err << "\n";
 		std::cerr << "Using default configuration." << std::endl;
@@ -124,7 +103,7 @@ int main(int argc, char** argv)
 		std::cerr << "Using default configuration." << std::endl;
 	}
 
-	RtspServer server(config.server, config.camera, config.hls);
+	RtspServer server(config.server, config.camera);
 	server.run();
 
 	return 0;

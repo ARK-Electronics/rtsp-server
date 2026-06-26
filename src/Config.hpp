@@ -76,14 +76,7 @@ struct CameraConfig {
 	}
 };
 
-struct HlsConfig {
-	bool enabled;
-	int segmentDuration;  // seconds of video per segment
-	int playlistLength;   // segments kept in the live playlist
-};
-
 struct AppConfig {
 	ServerConfig server;
 	CameraConfig camera;
-	HlsConfig hls;
 };

@@ -13,15 +13,3 @@ resolution = "1920x1080"
 resolution_options = ["320x240", "640x480", "1280x720", "1920x1080"]
 rotation = "0"
 rotation_options = ["0", "90", "180", "270"]
-
-# Browser-playable HLS restream of the RTSP feed (see README "Browser viewing"). It runs
-# on demand: only while a viewer lease (/dev/shm/ark-rtsp-hls.lease) is fresh, which the
-# ARK-OS gateway keeps touched while the web UI's Video page is open. Standalone (no
-# gateway), touch that file yourself to start it: `touch /dev/shm/ark-rtsp-hls.lease`.
-# Requires the hlssink2 element (gstreamer1.0-plugins-bad).
-[hls]
-enabled = false
-# Seconds of video per segment. Smaller = lower latency, more requests.
-segment_duration = 1
-# Number of segments kept in the live playlist.
-playlist_length = 5
