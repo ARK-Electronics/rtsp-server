@@ -114,6 +114,16 @@ void hls_drop_pipeline(HlsContext* ctx)
 
 void hls_start_pipeline(HlsContext* ctx)
 {
+	// Start each restream from an empty output dir. When the previous session stops,
+	// hlssink2 finalizes the playlist with #EXT-X-ENDLIST; left in place, the next
+	// viewer's player reads that as a finished VOD — full seek bar, playback from the
+	// first segment, never the live edge — until the new pipeline overwrites it. Clearing
+	// first guarantees the only playlist a new viewer can fetch is the fresh live one
+	// (nginx 404s in the brief gap, which the Video page handles by retrying).
+	std::error_code ec;
+	std::filesystem::remove_all(HLS_OUTPUT_DIR, ec);
+	std::filesystem::create_directories(HLS_OUTPUT_DIR, ec);
+
 	GError* err = nullptr;
 	ctx->pipeline = gst_parse_launch(ctx->launch.c_str(), &err);
 
@@ -330,9 +340,16 @@ std::string RtspServer::create_jetson_pipeline()
 	// support, so it is better to wait a moment for a real answer.
 	std::vector<SensorMode> modes = probe_sensor_modes(sensorId);
 
+	// Rate-limit the log (first few, then ~every 30s): an absent or never-free camera
+	// would otherwise write one journal line a second forever — the spam that made the
+	// log look stuck on this message.
 	for (int attempt = 1; modes.empty(); ++attempt) {
-		std::cout << "No sensor modes detected (attempt " << attempt
-			  << "; is v4l-utils installed and the camera free?); retrying in 1s..." << std::endl;
+		if (attempt <= 5 || attempt % 30 == 0) {
+			std::cout << "No sensor modes detected (attempt " << attempt
+				  << "; is a camera connected, v4l-utils installed, and the camera free?); "
+				  << "retrying every 1s..." << std::endl;
+		}
+
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 		modes = probe_sensor_modes(sensorId);
 	}
