@@ -17,7 +17,8 @@ int main(int argc, char** argv)
 			.resolution = ResolutionPreset::R640x480,
 			.framerate = 15,
 			.bitrate = 2000,
-			.rotation = CameraRotation::ROTATE_0
+			.rotation = CameraRotation::ROTATE_0,
+			.device = ""
 		}
 	};
 
@@ -91,6 +92,12 @@ int main(int argc, char** argv)
 				config.camera.rotation = stringToRotation(rotStr);
 				std::cout << "Rotation set to: " << rotationToString(config.camera.rotation)
 					  << " degrees" << std::endl;
+			}
+
+			if (camera->contains("device")) {
+				config.camera.device = (*camera)["device"].value_or("");
+				std::cout << "Camera device set to: "
+					  << (config.camera.device.empty() ? "auto" : config.camera.device) << std::endl;
 			}
 		}
 

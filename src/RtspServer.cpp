@@ -114,23 +114,107 @@ void RtspServer::run()
 	gst::g_object_unref(server);
 }
 
+std::optional<VideoDevice> RtspServer::select_device(const std::vector<VideoDevice>& devices)
+{
+	if (devices.empty()) {
+		return std::nullopt;
+	}
+
+	// An explicit device from config/UI wins, as long as it's actually connected.
+	if (!_cameraConfig.device.empty()) {
+		auto it = std::find_if(devices.begin(), devices.end(), [&](const VideoDevice & d) {
+			return d.path == _cameraConfig.device;
+		});
+
+		if (it != devices.end()) {
+			return *it;
+		}
+
+		std::cout << "Configured camera " << _cameraConfig.device
+			  << " not found among connected devices; falling back to auto-select" << std::endl;
+	}
+
+	// Auto-select: the lowest-numbered capture node (enumerate_video_devices() returns
+	// them sorted ascending). On Jetson a connected CSI sensor is /dev/video0, so it
+	// naturally wins over a USB camera that enumerates later.
+	return devices.front();
+}
+
 std::string RtspServer::get_pipeline(Platform platform)
 {
+	const std::vector<VideoDevice> devices = enumerate_video_devices();
+
+	for (const auto& d : devices) {
+		std::cout << "Detected camera " << d.path << " [" << camera_type_name(d.type)
+			  << "] driver=" << d.driver << " card=\"" << d.name << "\"" << std::endl;
+	}
+
+	const std::optional<VideoDevice> selected = select_device(devices);
+
+	if (selected) {
+		std::cout << "Selected camera " << selected->path << " (" << camera_type_name(selected->type)
+			  << ")" << std::endl;
+	}
+
+	// Routing is platform-primary: each platform owns the source element for its native
+	// CSI stack (nvarguscamerasrc / libcamerasrc), and a USB/UVC camera goes through
+	// v4l2src on any platform.
 	switch (platform) {
-	case Platform::Ubuntu:
-		return create_ubuntu_pipeline();
+	case Platform::Jetson:
+
+		// A connected USB webcam streams via v4l2src; otherwise use the Argus CSI source
+		// (also the no-camera default, whose mode probe waits for the sensor to appear).
+		if (selected && selected->type == CameraType::Usb) {
+			return create_usb_pipeline(selected->path);
+		}
+
+		return create_jetson_pipeline(csi_sensor_id(devices, selected));
 
 	case Platform::Pi:
+
+		// Only a UVC webcam uses v4l2src; CSI sensors (and their raw Bayer /dev/video
+		// nodes, which v4l2src can't consume) go through libcamerasrc.
+		if (selected && selected->type == CameraType::Usb) {
+			return create_usb_pipeline(selected->path);
+		}
+
 		return create_pi_pipeline();
 
-	case Platform::Jetson:
-		return create_jetson_pipeline();
+	case Platform::Ubuntu:
+
+		// Desktop has no CSI ISP source: stream any real capture device via v4l2src,
+		// else fall back to the test pattern so the stream still comes up.
+		if (selected) {
+			return create_usb_pipeline(selected->path);
+		}
+
+		return create_ubuntu_pipeline();
 	}
 
 	return create_ubuntu_pipeline();
 }
 
-std::string RtspServer::create_jetson_pipeline()
+int RtspServer::csi_sensor_id(const std::vector<VideoDevice>& devices, const std::optional<VideoDevice>& selected)
+{
+	// nvarguscamerasrc sensor-id is the CSI sensor's rank, not the /dev/video number, so
+	// count the CSI nodes that sort before the selected one. Single-camera rigs (and the
+	// no-selection default) stay sensor-id 0.
+	if (!selected || selected->type != CameraType::Csi) {
+		return 0;
+	}
+
+	int sensorId = 0;
+
+	for (const auto& d : devices) {
+		if (d.type == CameraType::Csi && d.index < selected->index) {
+			++sensorId;
+		}
+	}
+
+	return sensorId;
+}
+
+std::string RtspServer::create_jetson_pipeline(int sensorId)
 {
 	std::stringstream ss;
 
@@ -138,7 +222,6 @@ std::string RtspServer::create_jetson_pipeline()
 	// framerate the sensor can't deliver makes nvarguscamerasrc fail to acquire the
 	// camera ("Frame Rate specified is greater than supported"), which then cascades
 	// into "No cameras available" under the systemd restart loop.
-	const int sensorId = 0;
 
 	// Retry the probe until the sensor reports its modes instead of falling back.
 	// Right after a restart the previous process's nvarguscamerasrc can still hold
@@ -258,6 +341,63 @@ std::string RtspServer::create_pi_pipeline()
 	// Complete the pipeline with encoder and payloader
 	ss << "video/x-raw,format=I420 ! "
 	   << "x264enc key-int-max=30 bitrate=" << _cameraConfig.bitrate
+	   << " tune=zerolatency speed-preset=ultrafast ! "
+	   << "video/x-h264,stream-format=byte-stream,profile=baseline ! "
+	   << "rtph264pay config-interval=1 mtu=1400 name=pay0 pt=96 )";
+
+	std::cout << "Using pipeline: " << ss.str() << std::endl;
+	return ss.str();
+}
+
+std::string RtspServer::create_usb_pipeline(const std::string& device)
+{
+	std::stringstream ss;
+
+	int width = _cameraConfig.getWidth();
+	int height = _cameraConfig.getHeight();
+	// Cap framerate at 30fps, matching the other software-encoded pipelines.
+	int framerate = std::min(_cameraConfig.framerate, 30);
+
+	// Output size after rotation: 90/270 swap width and height.
+	int outWidth = width;
+	int outHeight = height;
+
+	if (_cameraConfig.rotation == CameraRotation::ROTATE_90 || _cameraConfig.rotation == CameraRotation::ROTATE_270) {
+		std::swap(outWidth, outHeight);
+	}
+
+	// decodebin makes this work across the two ways USB cameras expose video: cheap
+	// webcams stream MJPEG (decodebin inserts jpegdec) while others emit raw YUYV
+	// (decodebin passes it through). videoscale/videorate then force a deterministic
+	// output size and rate regardless of which native mode the camera negotiated.
+	ss << "( v4l2src device=" << device << " ! "
+	   << "decodebin ! "
+	   << "videoconvert ! ";
+
+	// Add rotation using videoflip element
+	switch (_cameraConfig.rotation) {
+	case CameraRotation::ROTATE_90:
+		ss << "videoflip method=clockwise ! ";
+		break;
+
+	case CameraRotation::ROTATE_180:
+		ss << "videoflip method=rotate-180 ! ";
+		break;
+
+	case CameraRotation::ROTATE_270:
+		ss << "videoflip method=counterclockwise ! ";
+		break;
+
+	default:
+		// No rotation needed
+		break;
+	}
+
+	ss << "videoscale ! videorate ! "
+	   << "video/x-raw,format=I420,width=" << outWidth
+	   << ",height=" << outHeight
+	   << ",framerate=" << framerate << "/1 ! "
+	   << "x264enc key-int-max=" << framerate << " bitrate=" << _cameraConfig.bitrate
 	   << " tune=zerolatency speed-preset=ultrafast ! "
 	   << "video/x-h264,stream-format=byte-stream,profile=baseline ! "
 	   << "rtph264pay config-interval=1 mtu=1400 name=pay0 pt=96 )";
