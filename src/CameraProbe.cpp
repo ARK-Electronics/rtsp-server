@@ -1,10 +1,18 @@
 #include "CameraProbe.hpp"
 #include <array>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <memory>
 #include <sstream>
+
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <linux/videodev2.h>
 
 namespace
 {
@@ -27,7 +35,107 @@ std::string run_command(const std::string& cmd)
 	return result;
 }
 
+// CSI sensors on Jetson bind to the "tegra-video" VI driver; on Pi they come up via
+// the unicam/rp1-cfe drivers but are streamed through libcamerasrc, not this node.
+// USB webcams are uvcvideo. Everything else (loopback, virtual, encoders) is Other.
+CameraType classify_driver(const std::string& driver)
+{
+	if (driver.find("tegra") != std::string::npos || driver == "vi-output") {
+		return CameraType::Csi;
+	}
+
+	if (driver == "uvcvideo") {
+		return CameraType::Usb;
+	}
+
+	return CameraType::Other;
+}
+
 } // namespace
+
+const char* camera_type_name(CameraType type)
+{
+	switch (type) {
+	case CameraType::Csi:   return "csi";
+
+	case CameraType::Usb:   return "usb";
+
+	case CameraType::Other: return "other";
+	}
+
+	return "other";
+}
+
+std::vector<VideoDevice> enumerate_video_devices()
+{
+	std::vector<VideoDevice> devices;
+	namespace fs = std::filesystem;
+
+	std::error_code ec;
+	if (!fs::exists("/dev", ec)) {
+		return devices;
+	}
+
+	for (const auto& entry : fs::directory_iterator("/dev", ec)) {
+		const std::string name = entry.path().filename().string();
+
+		// Only /dev/videoN nodes, where N is a number (skip e.g. /dev/video-enc).
+		if (name.rfind("video", 0) != 0) {
+			continue;
+		}
+
+		const std::string digits = name.substr(std::strlen("video"));
+
+		if (digits.empty() || !std::all_of(digits.begin(), digits.end(), [](unsigned char c) {
+		return std::isdigit(c);
+		})) {
+			continue;
+		}
+
+		const std::string path = entry.path().string();
+
+		// O_NONBLOCK so a node held open elsewhere (a busy CSI sensor) still answers
+		// QUERYCAP without blocking; QUERYCAP needs no streaming access.
+		int fd = open(path.c_str(), O_RDWR | O_NONBLOCK);
+
+		if (fd < 0) {
+			continue;
+		}
+
+		struct v4l2_capability cap {};
+		const int rc = ioctl(fd, VIDIOC_QUERYCAP, &cap);
+		close(fd);
+
+		if (rc != 0) {
+			continue;
+		}
+
+		// device_caps describes THIS node specifically (a UVC camera's metadata node
+		// reports Metadata Capture here, not Video Capture); fall back to the device-wide
+		// capabilities when the split isn't advertised.
+		const __u32 caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+
+		if (!(caps & V4L2_CAP_VIDEO_CAPTURE)) {
+			continue;
+		}
+
+		const std::string driver(reinterpret_cast<const char*>(cap.driver));
+
+		devices.push_back({
+			std::stoi(digits),
+			path,
+			std::string(reinterpret_cast<const char*>(cap.card)),
+			driver,
+			classify_driver(driver),
+		});
+	}
+
+	std::sort(devices.begin(), devices.end(), [](const VideoDevice & a, const VideoDevice & b) {
+		return a.index < b.index;
+	});
+
+	return devices;
+}
 
 std::vector<SensorMode> probe_sensor_modes(int sensor_id)
 {

@@ -3,6 +3,35 @@
 #include <string>
 #include <vector>
 
+// How a /dev/video* node is driven, which decides the GStreamer source element:
+// CSI sensors go through nvarguscamerasrc (Jetson) or libcamerasrc (Pi); USB/UVC
+// webcams go through v4l2src on any platform.
+enum class CameraType {
+	Csi,
+	Usb,
+	Other,
+};
+
+// One enumerated V4L2 capture node (/dev/videoN). `index` is N, used both to order
+// devices (auto-selection picks the lowest) and to derive the nvarguscamerasrc
+// sensor-id for CSI sensors.
+struct VideoDevice {
+	int index;
+	std::string path;     // e.g. "/dev/video0"
+	std::string name;     // V4L2 card name, e.g. "vi-output, imx219 9-0010" or "HD Webcam"
+	std::string driver;   // V4L2 driver name, e.g. "tegra-video" or "uvcvideo"
+	CameraType type;
+};
+
+// Human-readable label for a CameraType ("csi"/"usb"/"other").
+const char* camera_type_name(CameraType type);
+
+// Enumerate every /dev/video* node that can actually capture video (VIDIOC_QUERYCAP
+// reports V4L2_CAP_VIDEO_CAPTURE), sorted ascending by index. UVC webcams expose
+// extra metadata-only nodes; those are filtered out here so they never get picked.
+// Returns an empty vector if no capture device is present.
+std::vector<VideoDevice> enumerate_video_devices();
+
 // A single discrete capture mode as reported by the kernel V4L2 driver.
 struct SensorMode {
 	int width;
