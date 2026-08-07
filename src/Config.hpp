@@ -44,6 +44,9 @@ struct CameraConfig {
 	int framerate;
 	int bitrate;
 	CameraRotation rotation;
+	// Selected capture device node (e.g. "/dev/video0"). Empty means auto-select the
+	// lowest-numbered connected camera. Set by the ARK-OS camera-manager / web UI.
+	std::string device;
 
 	std::pair<int, int> getDimensions() const
 	{

@@ -13,3 +13,9 @@ resolution = "1920x1080"
 resolution_options = ["320x240", "640x480", "1280x720", "1920x1080"]
 rotation = "0"
 rotation_options = ["0", "90", "180", "270"]
+# Capture device to stream. Empty = auto-select the lowest-numbered connected camera
+# (e.g. /dev/video0). On Jetson a CSI sensor is driven via nvarguscamerasrc and a USB
+# webcam via v4l2src; the server picks the right source from the device's V4L2 driver.
+# Set explicitly (e.g. "/dev/video1") to force a particular camera — the ARK-OS web UI
+# writes this field when you choose a camera on the Video page.
+device = ""
