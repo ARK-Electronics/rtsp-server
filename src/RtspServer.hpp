@@ -17,6 +17,7 @@ private:
 	};
 
 	Platform detect_platform();
+	bool has_hardware_h264_encoder();
 	std::string get_pipeline(Platform platform);
 	std::string create_jetson_pipeline();
 	std::string create_pi_pipeline();
