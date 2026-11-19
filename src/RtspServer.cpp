@@ -205,12 +205,25 @@ std::string RtspServer::create_jetson_pipeline()
 	   << "video/x-raw(memory:NVMM),width=" << profile.width
 	   << ",height=" << profile.height
 	   << ",framerate=" << profile.framerate << "/1 ! "
-	   << "nvvidconv flip-method=" << flipMethod << " ! "
-	   << "video/x-raw,width=" << outWidth << ",height=" << outHeight << ",format=I420 ! "
-	   << "x264enc key-int-max=" << profile.framerate << " bitrate=" << _cameraConfig.bitrate
-	   << " tune=zerolatency speed-preset=ultrafast ! "
-	   << "video/x-h264,stream-format=byte-stream,profile=baseline ! "
-	   << "rtph264pay config-interval=1 mtu=1400 name=pay0 pt=96 )";
+	   << "nvvidconv flip-method=" << flipMethod << " ! ";
+
+	// NVENC takes the frames where nvvidconv leaves them, in NVMM. x264enc needs them
+	// copied to system memory and costs more than a CPU core at 1080p30.
+	const std::string nvenc = nvenc_encoder(profile.framerate);
+
+	if (has_hardware_h264_encoder(nvenc)) {
+		ss << "video/x-raw(memory:NVMM),width=" << outWidth << ",height=" << outHeight << ",format=NV12 ! "
+		   << nvenc << " ! "
+		   << "video/x-h264,stream-format=byte-stream,alignment=au ! ";
+
+	} else {
+		ss << "video/x-raw,width=" << outWidth << ",height=" << outHeight << ",format=I420 ! "
+		   << "x264enc key-int-max=" << profile.framerate << " bitrate=" << _cameraConfig.bitrate
+		   << " tune=zerolatency speed-preset=ultrafast ! "
+		   << "video/x-h264,stream-format=byte-stream,profile=baseline ! ";
+	}
+
+	ss << "rtph264pay config-interval=1 mtu=1400 name=pay0 pt=96 )";
 
 	std::cout << "Using pipeline: " << ss.str() << std::endl;
 	return ss.str();
@@ -311,6 +324,57 @@ std::string RtspServer::create_ubuntu_pipeline()
 
 	std::cout << "Using pipeline: " << ss.str() << std::endl;
 	return ss.str();
+}
+
+std::string RtspServer::nvenc_encoder(int framerate)
+{
+	// Only properties that JetPack 6's and JetPack 7's nvv4l2h264enc both have. Its bitrate
+	// is in bit/s, x264enc's in kbit/s. A keyframe every second, as with x264enc.
+	std::stringstream ss;
+	ss << "nvv4l2h264enc bitrate=" << _cameraConfig.bitrate * 1000 << " control-rate=1 profile=0"
+	   << " iframeinterval=" << framerate << " idrinterval=" << framerate << " insert-sps-pps=true";
+	return ss.str();
+}
+
+bool RtspServer::has_hardware_h264_encoder(const std::string& encoder)
+{
+	// The Orin Nano has no NVENC, yet its device tree enables the engine and the plugin
+	// is installed, so only encoding frames shows whether the encoder works. The test uses
+	// the stream's own encoder settings, so a property the installed plugin lacks fails here.
+	const std::string test = "videotestsrc num-buffers=2 ! video/x-raw,width=320,height=240 ! nvvidconv ! "
+				 "video/x-raw(memory:NVMM),format=NV12 ! " + encoder + " ! fakesink";
+	gst::GError* error = nullptr;
+	gst::GstElement* probe = gst::gst_parse_launch(test.c_str(), &error);
+
+	if (!probe) {
+		std::cout << "Hardware H.264 encoder unavailable: " << (error ? error->message : "no pipeline") << std::endl;
+		gst::g_clear_error(&error);
+		return false;
+	}
+
+	if (error) {
+		std::cout << "Hardware H.264 encoder settings rejected: " << error->message << ", using x264enc" << std::endl;
+		gst::g_clear_error(&error);
+		gst::gst_object_unref(probe);
+		return false;
+	}
+
+	gst::gst_element_set_state(probe, gst::GST_STATE_PLAYING);
+	gst::GstBus* bus = gst::gst_element_get_bus(probe);
+	gst::GstMessage* msg = gst::gst_bus_timed_pop_filtered(bus, 5000000000ULL,
+			       static_cast<gst::GstMessageType>(gst::GST_MESSAGE_EOS | gst::GST_MESSAGE_ERROR));
+	const bool works = msg && msg->type == gst::GST_MESSAGE_EOS;
+
+	if (msg) {
+		gst::gst_message_unref(msg);
+	}
+
+	gst::gst_object_unref(bus);
+	gst::gst_element_set_state(probe, gst::GST_STATE_NULL);
+	gst::gst_object_unref(probe);
+
+	std::cout << "Hardware H.264 encoder " << (works ? "works, using nvv4l2h264enc" : "failed, using x264enc") << std::endl;
+	return works;
 }
 
 RtspServer::Platform RtspServer::detect_platform()

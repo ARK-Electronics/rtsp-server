@@ -17,6 +17,8 @@ private:
 	};
 
 	Platform detect_platform();
+	std::string nvenc_encoder(int framerate);
+	bool has_hardware_h264_encoder(const std::string& encoder);
 	std::string get_pipeline(Platform platform);
 	std::string create_jetson_pipeline();
 	std::string create_pi_pipeline();
